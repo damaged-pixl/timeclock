@@ -80,6 +80,12 @@ fun fmtDuration(ms: Long): String {
     return String.format(Locale.UK, "%d:%02d", mins / 60, mins % 60)
 }
 
+/** h:mm:ss — for the live running-session readout. */
+fun fmtHms(ms: Long): String {
+    val s = ms / 1000
+    return String.format(Locale.UK, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+}
+
 fun fmtClock(ts: Long): String = Calendar.getInstance().run {
     timeInMillis = ts
     String.format(Locale.UK, "%02d:%02d", get(Calendar.HOUR_OF_DAY), get(Calendar.MINUTE))

@@ -133,4 +133,11 @@ class CalcTest {
         assertEquals("1:28", fmtDuration(88 * 60000L))
         assertEquals("0:05", fmtDuration(5 * 60000L))
     }
+
+    @Test
+    fun `fmtHms formats live session readout`() {
+        assertEquals("0:00:05", fmtHms(5_000L))
+        assertEquals("1:02:03", fmtHms(3_723_000L))
+        assertEquals("12:00:00", fmtHms(43_200_000L))
+    }
 }

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- clock face -->
+    <path
+        android:pathData="M54,30a24,24 0 1,0 0.1,0Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:fillColor="#00000000" />
+    <!-- hour hand, pointing to 12 -->
+    <path
+        android:pathData="M54,54L54,41"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <!-- minute hand, pointing to ~4 o'clock -->
+    <path
+        android:pathData="M54,54L65,59"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <!-- centre pin -->
+    <path
+        android:pathData="M54,53m-3,0a3,3 0 1,1 6,0a3,3 0 1,1 -6,0"
+        android:fillColor="#FFFFFF" />
+</vector>

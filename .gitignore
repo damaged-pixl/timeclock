@@ -22,3 +22,4 @@ captures/
 .cxx/
 *.apk
 *.aab
+keystore.properties
