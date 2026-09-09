@@ -41,6 +41,9 @@ android {
 
     buildTypes {
         release {
+            // Debuggable on purpose: keeps `run-as` access for DB backup/restore
+            // and surgery (same maintenance workflow as the check-in app).
+            isDebuggable = true
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
