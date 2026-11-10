@@ -43,6 +43,20 @@ class TimeDb(context: Context) : SQLiteOpenHelper(context, "timeclock.db", null,
         writableDatabase.delete("punches", "id = ?", arrayOf(id.toString()))
     }
 
+    /** Correct a punch's timestamp in place (type stays put, so pairing is unchanged). */
+    fun updatePunchTime(id: Long, ts: Long) {
+        val v = ContentValues()
+        v.put("ts", ts)
+        writableDatabase.update("punches", v, "id = ?", arrayOf(id.toString()))
+    }
+
+    /** Used by CSV restore to skip rows that are already in the db. */
+    fun hasPunch(ts: Long, type: String): Boolean =
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM punches WHERE ts = ? AND type = ? LIMIT 1",
+            arrayOf(ts.toString(), type)
+        ).use { it.moveToFirst() }
+
     fun clear() {
         writableDatabase.delete("punches", null, null)
     }

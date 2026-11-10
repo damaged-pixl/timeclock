@@ -75,6 +75,53 @@ fun floorMonth(ts: Long): Long = Calendar.getInstance().run {
     timeInMillis
 }
 
+/**
+ * Midnight at the start of the next day. Calendar-based on purpose: adding a
+ * fixed 86 400 000 ms skips/repeats an hour on the two UK DST change days.
+ */
+fun nextDayStart(dayStart: Long): Long = Calendar.getInstance().run {
+    timeInMillis = floorDay(dayStart)
+    add(Calendar.DAY_OF_MONTH, 1)
+    timeInMillis
+}
+
+/** First instant of the month [ts] belongs to, moved [delta] months. */
+fun shiftMonth(ts: Long, delta: Int): Long = Calendar.getInstance().run {
+    timeInMillis = floorMonth(ts)
+    add(Calendar.MONTH, delta)
+    timeInMillis
+}
+
+data class DayTotal(val dayStart: Long, val totalMs: Long)
+
+data class MonthSummary(
+    val monthStart: Long,
+    val totalMs: Long,
+    val daysWorked: Int,
+    /** Only days with time on them, oldest first. */
+    val dayTotals: List<DayTotal>
+)
+
+/** One month's worked time plus the per-day breakdown that makes it up. */
+fun summariseMonth(entries: List<Punch>, monthStart: Long, now: Long): MonthSummary {
+    val start = floorMonth(monthStart)
+    val end = shiftMonth(start, 1)
+    val days = ArrayList<DayTotal>()
+    var cursor = start
+    while (cursor < end) {
+        val next = minOf(nextDayStart(cursor), end)
+        val ms = totalInRange(entries, cursor, next, now)
+        if (ms > 0) days.add(DayTotal(cursor, ms))
+        cursor = next
+    }
+    return MonthSummary(
+        monthStart = start,
+        totalMs = days.sumOf { it.totalMs },
+        daysWorked = days.size,
+        dayTotals = days
+    )
+}
+
 fun fmtDuration(ms: Long): String {
     val mins = ms / 60000
     return String.format(Locale.UK, "%d:%02d", mins / 60, mins % 60)

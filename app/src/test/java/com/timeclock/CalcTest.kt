@@ -14,6 +14,13 @@ class CalcTest {
         timeInMillis
     }
 
+    /** Convenience for month-boundary tests: [month] is 1-based. */
+    private fun ts(year: Int, month: Int, day: Int, h: Int = 0, m: Int = 0): Long =
+        java.util.Calendar.getInstance().run {
+            set(year, month - 1, day, h, m, 0); set(java.util.Calendar.MILLISECOND, 0)
+            timeInMillis
+        }
+
     @Test
     fun `sessions pairs in-out and leaves stray in open`() {
         val list = listOf(
@@ -139,5 +146,44 @@ class CalcTest {
         assertEquals("0:00:05", fmtHms(5_000L))
         assertEquals("1:02:03", fmtHms(3_723_000L))
         assertEquals("12:00:00", fmtHms(43_200_000L))
+    }
+
+    @Test
+    fun `shiftMonth moves whole months and crosses the year`() {
+        assertEquals(ts(2026, 8, 1), shiftMonth(ts(2026, 9, 17, 16, 16), -1))
+        assertEquals(ts(2027, 1, 1), shiftMonth(ts(2026, 12, 31, 23, 59), 1))
+        assertEquals(ts(2026, 2, 1), shiftMonth(ts(2026, 3, 31, 12, 0), -1))
+    }
+
+    @Test
+    fun `nextDayStart rolls over month end`() {
+        assertEquals(ts(2026, 10, 1), nextDayStart(ts(2026, 9, 30, 23, 59)))
+        assertEquals(ts(2026, 9, 3), nextDayStart(ts(2026, 9, 2, 0, 0)))
+    }
+
+    @Test
+    fun `summariseMonth groups day totals and ignores other months`() {
+        val list = listOf(
+            // 31 Aug — belongs to the previous month.
+            p(1, ts(2026, 8, 31, 9, 0), "in"), p(2, ts(2026, 8, 31, 12, 0), "out"),
+            // 2 Sept — 2h.
+            p(3, ts(2026, 9, 2, 9, 0), "in"), p(4, ts(2026, 9, 2, 11, 0), "out"),
+            // 3 Sept — 1h.
+            p(5, ts(2026, 9, 3, 9, 0), "in"), p(6, ts(2026, 9, 3, 10, 0), "out")
+        )
+        val summary = summariseMonth(list, ts(2026, 9, 15), ts(2026, 9, 30, 18, 0))
+        assertEquals(ts(2026, 9, 1), summary.monthStart)
+        assertEquals(180 * 60000L, summary.totalMs)
+        assertEquals(2, summary.daysWorked)
+        assertEquals(ts(2026, 9, 2), summary.dayTotals[0].dayStart)
+        assertEquals(120 * 60000L, summary.dayTotals[0].totalMs)
+        assertEquals(60 * 60000L, summary.dayTotals[1].totalMs)
+    }
+
+    @Test
+    fun `summariseMonth includes open sessions only up to now`() {
+        val list = listOf(p(1, ts(2026, 9, 2, 9, 0), "in"))
+        val summary = summariseMonth(list, ts(2026, 9, 1), ts(2026, 9, 2, 10, 30))
+        assertEquals(90 * 60000L, summary.totalMs)
     }
 }

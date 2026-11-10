@@ -3,10 +3,15 @@ package com.timeclock
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -81,6 +86,16 @@ class MainActivity : ComponentActivity() {
     private var pendingDelete by mutableStateOf<Punch?>(null)
     private var confirmReset by mutableStateOf(false)
     private var ratePence by mutableIntStateOf(0)
+
+    /** Non-null while the month report is open; holds that month's first instant. */
+    private var reportMonth by mutableStateOf<Long?>(null)
+    private var editingPunch by mutableStateOf<Punch?>(null)
+
+    /** CSV restore: reads punches back in, skipping ones already recorded. */
+    private val importLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) importCsv(uri)
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -158,11 +173,25 @@ class MainActivity : ComponentActivity() {
         val sb = StringBuilder("type,datetime\n")
         val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.UK)
         for (p in all) sb.append(p.type).append(',').append(fmt.format(Date(p.ts))).append('\n')
+        // Session/day/month rows are for reading in a spreadsheet; restore ignores them.
+        val dayFmt = SimpleDateFormat("yyyy-MM-dd", Locale.UK)
+        val monthFmt = SimpleDateFormat("yyyy-MM", Locale.UK)
         for (s in sessions(all)) {
             if (s.outTs != null) {
-                sb.append("duration_minutes,")
+                sb.append("session_minutes,")
+                    .append(fmt.format(Date(s.inTs))).append(',')
                     .append(String.format(Locale.UK, "%.1f", (s.outTs - s.inTs) / 60000.0)).append('\n')
             }
+        }
+        val hist = buildHistory(all, now)
+        for (d in hist) {
+            sb.append("day_minutes,").append(dayFmt.format(Date(d.dayStart))).append(',')
+                .append(String.format(Locale.UK, "%.1f", d.totalMs / 60000.0)).append('\n')
+        }
+        for (m in hist.groupBy { floorMonth(it.dayStart) }.keys) {
+            val ms = totalInRange(all, m, shiftMonth(m, 1), now)
+            sb.append("month_minutes,").append(monthFmt.format(Date(m))).append(',')
+                .append(String.format(Locale.UK, "%.1f", ms / 60000.0)).append('\n')
         }
         val content = sb.toString()
         thread {
@@ -179,6 +208,49 @@ class MainActivity : ComponentActivity() {
                 startActivity(Intent.createChooser(send, "Send time clock export"))
             }
         }
+    }
+
+    /**
+     * Restore punches from an exported CSV. Only "in"/"out" rows with a valid
+     * timestamp are read, so summary rows (and the header) are ignored. Anything
+     * already in the db is skipped, so importing the same file twice is harmless.
+     */
+    private fun importCsv(uri: Uri) {
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.UK).apply { isLenient = false }
+        thread {
+            var added = 0
+            var skipped = 0
+            var failed = false
+            try {
+                val text = contentResolver.openInputStream(uri)?.bufferedReader()?.readText()
+                    ?: throw IllegalStateException("could not open file")
+                for (raw in text.lineSequence()) {
+                    val parts = raw.trim().split(',')
+                    if (parts.size < 2) continue
+                    val type = parts[0]
+                    if (type != "in" && type != "out") continue
+                    val ts = try { fmt.parse(parts[1])?.time } catch (e: Exception) { null } ?: continue
+                    if (db.hasPunch(ts, type)) skipped++ else { db.addPunch(type, ts); added++ }
+                }
+            } catch (e: Exception) {
+                failed = true
+            }
+            runOnUiThread {
+                reload()
+                Toast.makeText(
+                    this,
+                    if (failed) "Restore failed — is that a timeclock CSV?"
+                    else "Restored $added punches, skipped $skipped duplicates",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    private fun saveEdit(punch: Punch, ts: Long) {
+        db.updatePunchTime(punch.id, ts)
+        editingPunch = null
+        reload()
     }
 
     /** Group punches into per-day history rows, newest day first. Pairing comes
@@ -205,7 +277,7 @@ class MainActivity : ComponentActivity() {
                 DayHist(
                     dayStart = day,
                     rows = dayRows.sortedBy { it.first }.map { it.second },
-                    totalMs = totalInRange(all, day, day + 86_400_000, nowTs)
+                    totalMs = totalInRange(all, day, nextDayStart(day), nowTs)
                 )
             }
             .sortedByDescending { it.dayStart }
@@ -221,19 +293,31 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // System back closes the month report instead of leaving the app.
+        BackHandler(enabled = reportMonth != null) { reportMonth = null }
+
         val clockedIn = isClockedIn(punches)
         val dayStart = floorDay(now)
-        val dayEnd = dayStart + 86_400_000 // exclusive: midnight tonight
+        val dayEnd = nextDayStart(dayStart) // exclusive: midnight tonight
         val today = totalInRange(punches, dayStart, dayEnd, now)
         val week = totalInRange(punches, floorWeek(now), dayEnd, now)
         val month = totalInRange(punches, floorMonth(now), dayEnd, now)
+        val lastMonthStart = shiftMonth(now, -1)
+        val lastMonth = totalInRange(punches, lastMonthStart, floorMonth(now), now)
         val allTime = totalInRange(punches, Long.MIN_VALUE, Long.MAX_VALUE, now)
         val sessionMs = if (clockedIn) now - punches.last().ts else 0L
         val history = buildHistory(punches, now)
         val dayFmt = SimpleDateFormat("EEE d MMM", Locale.UK)
 
         Surface(modifier = Modifier.fillMaxSize(), color = Bg) {
-            LazyColumn(
+            val report = reportMonth
+            if (report != null) {
+                MonthReport(
+                    month = report,
+                    onMonthChange = { reportMonth = it },
+                    onBack = { reportMonth = null }
+                )
+            } else LazyColumn(
                 modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
@@ -284,15 +368,32 @@ class MainActivity : ComponentActivity() {
                     }
                     Spacer(Modifier.height(12.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        StatCard("THIS MONTH", fmtDuration(month), money(month), Modifier.weight(1f))
-                        StatCard("ALL TIME", fmtDuration(allTime), money(allTime), Modifier.weight(1f))
+                        StatCard(
+                            "THIS MONTH", fmtDuration(month), money(month), Modifier.weight(1f),
+                            onClick = { reportMonth = floorMonth(now) }
+                        )
+                        StatCard(
+                            "LAST MONTH ›", fmtDuration(lastMonth), money(lastMonth), Modifier.weight(1f),
+                            onClick = { reportMonth = lastMonthStart }
+                        )
                     }
+                    Spacer(Modifier.height(12.dp))
+                    StatCard(
+                        "ALL TIME ›", fmtDuration(allTime), money(allTime),
+                        Modifier.fillMaxWidth(),
+                        onClick = { reportMonth = floorMonth(now) }
+                    )
                     Spacer(Modifier.height(32.dp))
 
                     Text(
                         "History",
                         color = Muted, fontSize = 14.sp,
                         modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "Tap a punch to edit · long-press to delete",
+                        color = Muted, fontSize = 11.sp,
+                        modifier = Modifier.fillMaxWidth().padding(top = 2.dp)
                     )
                     Spacer(Modifier.height(8.dp))
                 }
@@ -301,24 +402,47 @@ class MainActivity : ComponentActivity() {
                     item {
                         Text("No punches yet", color = Muted, modifier = Modifier.padding(8.dp))
                     }
-                } else for (day in history) {
-                    item(key = "day-${day.dayStart}") {
+                } else for ((monthStart, monthDays) in history.groupBy { floorMonth(it.dayStart) }) {
+                    item(key = "month-$monthStart") {
                         Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .padding(top = 14.dp, bottom = 2.dp),
+                            Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 2.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                if (day.dayStart == dayStart) "Today" else dayFmt.format(Date(day.dayStart)),
-                                color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold
+                                SimpleDateFormat("MMMM yyyy", Locale.UK)
+                                    .format(Date(monthStart)).uppercase(Locale.UK),
+                                color = Accent, fontSize = 12.sp, letterSpacing = 1.sp
                             )
                             Spacer(Modifier.weight(1f))
-                            Text(fmtDuration(day.totalMs), color = Muted, fontSize = 16.sp)
+                            Text(
+                                fmtDuration(totalInRange(punches, monthStart, shiftMonth(monthStart, 1), now)),
+                                color = Muted, fontSize = 12.sp
+                            )
                         }
                     }
-                    items(day.rows, key = { it.punch.id }) { row ->
-                        HistRowView(row, now, onLongPress = { pendingDelete = row.punch })
+                    for (day in monthDays) {
+                        item(key = "day-${day.dayStart}") {
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 10.dp, bottom = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    if (day.dayStart == dayStart) "Today" else dayFmt.format(Date(day.dayStart)),
+                                    color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold
+                                )
+                                Spacer(Modifier.weight(1f))
+                                Text(fmtDuration(day.totalMs), color = Muted, fontSize = 16.sp)
+                            }
+                        }
+                        items(day.rows, key = { it.punch.id }) { row ->
+                            HistRowView(
+                                row, now,
+                                onClick = { editingPunch = row.punch },
+                                onLongPress = { pendingDelete = row.punch }
+                            )
+                        }
                     }
                 }
 
@@ -344,8 +468,22 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = { reportMonth = floorMonth(now) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Monthly report", color = Accent)
+                        }
                         TextButton(onClick = { showSettings = true }, modifier = Modifier.weight(1f)) {
                             Text("Hourly rate", color = Accent)
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = { importLauncher.launch(arrayOf("text/*", "application/csv")) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Import / restore", color = Accent)
                         }
                         TextButton(onClick = { confirmReset = true }, modifier = Modifier.weight(1f)) {
                             Text("Reset all data", color = OutRed)
@@ -396,18 +534,34 @@ class MainActivity : ComponentActivity() {
         if (showSettings) {
             RateDialog(onDismiss = { showSettings = false })
         }
+
+        editingPunch?.let { p ->
+            EditPunchDialog(
+                punch = p,
+                onDismiss = { editingPunch = null },
+                onSave = { ts -> saveEdit(p, ts) },
+                onDelete = { db.deletePunch(p.id); reload(); editingPunch = null }
+            )
+        }
     }
 
     @Composable
-    private fun StatCard(label: String, value: String, pay: String, modifier: Modifier = Modifier) {
+    private fun StatCard(
+        label: String,
+        value: String,
+        pay: String,
+        modifier: Modifier = Modifier,
+        onClick: (() -> Unit)? = null
+    ) {
         Column(
             modifier = modifier
                 .background(Card, RoundedCornerShape(16.dp))
+                .then(if (onClick != null) Modifier.clickable { onClick() } else Modifier)
                 .padding(16.dp)
         ) {
             Text(label, color = Muted, fontSize = 12.sp, letterSpacing = 1.sp)
             Text(value, color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-            if (ratePence > 0) {
+            if (ratePence > 0 && pay.isNotEmpty()) {
                 Text(pay, color = Accent, fontSize = 15.sp, modifier = Modifier.padding(top = 2.dp))
             }
         }
@@ -415,7 +569,7 @@ class MainActivity : ComponentActivity() {
 
     @androidx.compose.foundation.ExperimentalFoundationApi
     @Composable
-    private fun HistRowView(row: HistRow, nowTs: Long, onLongPress: () -> Unit) {
+    private fun HistRowView(row: HistRow, nowTs: Long, onClick: () -> Unit, onLongPress: () -> Unit) {
         val dot = when (row) {
             is HistRow.InRow -> InGreen
             is HistRow.OutRow -> OutRed
@@ -424,7 +578,7 @@ class MainActivity : ComponentActivity() {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
                 .padding(vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -451,6 +605,190 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    /** Month-by-month report: any past month, with day totals and expandable punches. */
+    @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+    @Composable
+    private fun MonthReport(month: Long, onMonthChange: (Long) -> Unit, onBack: () -> Unit) {
+        val nowTs = now
+        val summary = summariseMonth(punches, month, nowTs)
+        val canNext = shiftMonth(month, 1) <= floorMonth(nowTs)
+        val monthName = SimpleDateFormat("MMMM yyyy", Locale.UK).format(Date(month))
+        val monthLast = shiftMonth(month, 1)
+        val days = buildHistory(punches, nowTs).filter { it.dayStart >= summary.monthStart && it.dayStart < monthLast }
+        val maxDay = summary.dayTotals.maxOfOrNull { it.totalMs } ?: 1L
+        var expandedDay by remember(month) { mutableStateOf<Long?>(null) }
+        val dayFmt = SimpleDateFormat("EEE d MMM", Locale.UK)
+        val avg = if (summary.daysWorked > 0) summary.totalMs / summary.daysWorked else 0L
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            item {
+                Spacer(Modifier.height(40.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = onBack) { Text("‹ Back", color = Accent, fontSize = 16.sp) }
+                    Spacer(Modifier.weight(1f))
+                    Text("REPORTS", color = Muted, fontSize = 12.sp, letterSpacing = 2.sp)
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { onMonthChange(shiftMonth(month, -1)) }) {
+                        Text("‹", color = Accent, fontSize = 26.sp)
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Text(monthName, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { onMonthChange(shiftMonth(month, 1)) }, enabled = canNext) {
+                        Text("›", color = if (canNext) Accent else Muted, fontSize = 26.sp)
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    fmtDuration(summary.totalMs),
+                    color = Color.White, fontSize = 56.sp, fontWeight = FontWeight.Bold
+                )
+                Text("total hours", color = Muted, fontSize = 13.sp, letterSpacing = 2.sp)
+                if (ratePence > 0) {
+                    Text(
+                        money(summary.totalMs), color = Accent, fontSize = 18.sp,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+                Spacer(Modifier.height(20.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    StatCard("DAYS WORKED", summary.daysWorked.toString(), "", Modifier.weight(1f))
+                    StatCard(
+                        "AVG / DAY",
+                        if (summary.daysWorked > 0) fmtDuration(avg) else "–",
+                        "", Modifier.weight(1f)
+                    )
+                }
+                Spacer(Modifier.height(28.dp))
+                Text("Days", color = Muted, fontSize = 14.sp, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(4.dp))
+            }
+
+            if (days.isEmpty()) {
+                item { Text("No punches this month", color = Muted, modifier = Modifier.padding(16.dp)) }
+            } else for (day in days) {
+                item(key = "mday-${day.dayStart}") {
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .combinedClickable(
+                                onClick = {
+                                    expandedDay = if (expandedDay == day.dayStart) null else day.dayStart
+                                },
+                                onLongClick = {}
+                            )
+                            .padding(vertical = 8.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                if (day.dayStart == floorDay(nowTs)) "Today" else dayFmt.format(Date(day.dayStart)),
+                                color = Color.White, fontSize = 16.sp
+                            )
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                fmtDuration(day.totalMs) + if (expandedDay == day.dayStart) "  ▾" else "  ›",
+                                color = if (expandedDay == day.dayStart) Accent else Muted, fontSize = 16.sp
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Box(Modifier.fillMaxWidth().height(6.dp).background(Card, CircleShape)) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth((day.totalMs.toFloat() / maxDay).coerceIn(0.02f, 1f))
+                                    .height(6.dp)
+                                    .background(Accent, CircleShape)
+                            )
+                        }
+                    }
+                }
+                if (expandedDay == day.dayStart) {
+                    items(day.rows, key = { "m-${it.punch.id}" }) { row ->
+                        HistRowView(
+                            row, nowTs,
+                            onClick = { editingPunch = row.punch },
+                            onLongPress = { pendingDelete = row.punch }
+                        )
+                    }
+                }
+            }
+
+            item {
+                Spacer(Modifier.height(32.dp))
+                Button(
+                    onClick = onBack,
+                    colors = ButtonDefaults.buttonColors(containerColor = Card, contentColor = Accent),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().height(52.dp)
+                ) { Text("Back to clock") }
+                Spacer(Modifier.height(48.dp))
+            }
+        }
+    }
+
+    /** Fix a mistyped punch in place instead of deleting and re-adding it. */
+    @Composable
+    private fun EditPunchDialog(punch: Punch, onDismiss: () -> Unit, onSave: (Long) -> Unit, onDelete: () -> Unit) {
+        var ts by remember(punch.id) { mutableLongStateOf(punch.ts) }
+        val dateFmt = SimpleDateFormat("EEE d MMM yyyy", Locale.UK)
+
+        fun pickDate() {
+            val c = Calendar.getInstance().apply { timeInMillis = ts }
+            DatePickerDialog(
+                this,
+                { _, y, m, d ->
+                    // set() keeps the current time of day, only the date changes.
+                    ts = Calendar.getInstance().apply {
+                        timeInMillis = ts
+                        set(y, m, d)
+                    }.timeInMillis
+                },
+                c.get(Calendar.YEAR), c.get(Calendar.MONTH), c.get(Calendar.DAY_OF_MONTH)
+            ).show()
+        }
+
+        fun pickTime() {
+            val c = Calendar.getInstance().apply { timeInMillis = ts }
+            TimePickerDialog(
+                this,
+                { _, h, m ->
+                    ts = Calendar.getInstance().apply {
+                        timeInMillis = ts
+                        set(Calendar.HOUR_OF_DAY, h); set(Calendar.MINUTE, m)
+                        set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                },
+                c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE), true
+            ).show()
+        }
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Edit ${if (punch.isIn) "in" else "out"} punch") },
+            text = {
+                Column {
+                    TextButton(onClick = { pickDate() }) {
+                        Text(dateFmt.format(Date(ts)), color = Accent)
+                    }
+                    TextButton(onClick = { pickTime() }) {
+                        Text(fmtClock(ts), color = Accent, fontSize = 22.sp)
+                    }
+                    TextButton(onClick = onDelete) {
+                        Text("Delete this punch", color = OutRed)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { onSave(ts) }) { Text("Save", color = Accent) }
+            },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        )
     }
 
     @Composable
