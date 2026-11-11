@@ -186,4 +186,138 @@ class CalcTest {
         val summary = summariseMonth(list, ts(2026, 9, 1), ts(2026, 9, 2, 10, 30))
         assertEquals(90 * 60000L, summary.totalMs)
     }
+
+    /* ---------- work-limit maths ---------- */
+
+    private fun kinds(marks: List<LimitMark>) = marks.map { it.kind to it.at }
+
+    @Test
+    fun `fresh morning session - half at 30min day at 60min afternoon half at 13-30`() {
+        val openIn = ts(2026, 9, 2, 9, 0)
+        val marks = limitCrossings(listOf(p(1, openIn, "in")), openIn)
+        assertEquals(
+            listOf(
+                LimitKind.HALF_MORNING to ts(2026, 9, 2, 9, 30),
+                LimitKind.DAY to ts(2026, 9, 2, 10, 0),
+                LimitKind.HALF_AFTERNOON to ts(2026, 9, 2, 13, 30)
+            ),
+            kinds(marks)
+        )
+    }
+
+    @Test
+    fun `session starting before 11 - morning can't finish, gap is free`() {
+        val openIn = ts(2026, 9, 2, 10, 50)
+        val marks = limitCrossings(listOf(p(1, openIn, "in")), openIn)
+        // 10 min of morning work accrues, the gap eats the rest of the hour,
+        // so the day mark lands 50 min into the afternoon.
+        assertEquals(
+            listOf(
+                LimitKind.HALF_AFTERNOON to ts(2026, 9, 2, 13, 30),
+                LimitKind.DAY to ts(2026, 9, 2, 13, 50)
+            ),
+            kinds(marks)
+        )
+    }
+
+    @Test
+    fun `clock back in after half stop - day backstop fires 30 min later`() {
+        val openIn = ts(2026, 9, 2, 9, 35)
+        val list = listOf(
+            p(1, ts(2026, 9, 2, 9, 0), "in"), p(2, ts(2026, 9, 2, 9, 30), "out"),
+            p(3, openIn, "in")
+        )
+        val marks = limitCrossings(list, openIn)
+        assertEquals(
+            listOf(
+                LimitKind.DAY to ts(2026, 9, 2, 10, 5),
+                LimitKind.HALF_AFTERNOON to ts(2026, 9, 2, 13, 30)
+            ),
+            kinds(marks)
+        )
+    }
+
+    @Test
+    fun `afternoon clock-in gets its own half`() {
+        val openIn = ts(2026, 9, 2, 14, 0)
+        val marks = limitCrossings(listOf(p(1, openIn, "in")), openIn)
+        assertEquals(
+            listOf(
+                LimitKind.HALF_AFTERNOON to ts(2026, 9, 2, 14, 30),
+                LimitKind.DAY to ts(2026, 9, 2, 15, 0)
+            ),
+            kinds(marks)
+        )
+    }
+
+    @Test
+    fun `session opened in the free gap skips the gap`() {
+        val openIn = ts(2026, 9, 2, 12, 0)
+        val marks = limitCrossings(listOf(p(1, openIn, "in")), openIn)
+        assertEquals(
+            listOf(
+                LimitKind.HALF_AFTERNOON to ts(2026, 9, 2, 13, 30),
+                LimitKind.DAY to ts(2026, 9, 2, 14, 0)
+            ),
+            kinds(marks)
+        )
+    }
+
+    @Test
+    fun `earlier closed work shifts the marks`() {
+        val openIn = ts(2026, 9, 2, 9, 20)
+        val list = listOf(
+            p(1, ts(2026, 9, 2, 9, 0), "in"), p(2, ts(2026, 9, 2, 9, 10), "out"),
+            p(3, openIn, "in")
+        )
+        val marks = limitCrossings(list, openIn)
+        assertEquals(
+            listOf(
+                LimitKind.HALF_MORNING to ts(2026, 9, 2, 9, 40),
+                LimitKind.DAY to ts(2026, 9, 2, 10, 10),
+                LimitKind.HALF_AFTERNOON to ts(2026, 9, 2, 13, 30)
+            ),
+            kinds(marks)
+        )
+    }
+
+    @Test
+    fun `day mark shares the afternoon half instant when morning already stopped`() {
+        val openIn = ts(2026, 9, 2, 13, 5)
+        val list = listOf(
+            p(1, ts(2026, 9, 2, 9, 0), "in"), p(2, ts(2026, 9, 2, 9, 30), "out"),
+            p(3, openIn, "in")
+        )
+        val marks = limitCrossings(list, openIn)
+        // Both marks land on 13:35 — checkAndSchedule dedupes them into one alarm.
+        assertEquals(2, marks.size)
+        assertTrue(marks.all { it.at == ts(2026, 9, 2, 13, 35) })
+    }
+
+    @Test
+    fun `all marks consumed - no crossings left`() {
+        val openIn = ts(2026, 9, 2, 13, 40)
+        val list = listOf(
+            p(1, ts(2026, 9, 2, 9, 0), "in"), p(2, ts(2026, 9, 2, 9, 30), "out"),
+            p(3, ts(2026, 9, 2, 13, 5), "in"), p(4, ts(2026, 9, 2, 13, 35), "out"),
+            p(5, openIn, "in")
+        )
+        assertTrue(limitCrossings(list, openIn).isEmpty())
+    }
+
+    @Test
+    fun `isThursday matches the calendar day`() {
+        assertTrue(Limit.isThursday(ts(2026, 11, 12, 9, 0))) // Thu 12 Nov 2026
+        assertFalse(Limit.isThursday(ts(2026, 11, 11, 9, 0))) // Wed 11 Nov 2026
+    }
+
+    @Test
+    fun `morning and afternoon work split a window-spanning session`() {
+        val list = listOf(
+            p(1, ts(2026, 9, 2, 10, 50), "in"), p(2, ts(2026, 9, 2, 13, 10), "out")
+        )
+        val day = ts(2026, 9, 2, 0, 0)
+        assertEquals(10 * 60000L, morningWork(list, day, ts(2026, 9, 2, 14, 0)))
+        assertEquals(10 * 60000L, afternoonWork(list, day, ts(2026, 9, 2, 14, 0)))
+    }
 }

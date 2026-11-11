@@ -137,3 +137,87 @@ fun fmtClock(ts: Long): String = Calendar.getInstance().run {
     timeInMillis = ts
     String.format(Locale.UK, "%02d:%02d", get(Calendar.HOUR_OF_DAY), get(Calendar.MINUTE))
 }
+
+/* ---------- Work-limit maths ---------- */
+
+const val LIMIT_MORNING_END_HOUR = 11
+const val LIMIT_AFTERNOON_START_HOUR = 13
+const val LIMIT_HALF_MS = 30L * 60_000
+const val LIMIT_DAY_MS = 60L * 60_000
+
+enum class LimitKind { HALF_MORNING, HALF_AFTERNOON, DAY }
+
+data class LimitMark(val kind: LimitKind, val at: Long)
+
+/** 11:00 on the day of [ts] — the morning window ends here. */
+fun limitMorningEnd(ts: Long): Long = Calendar.getInstance().run {
+    timeInMillis = floorDay(ts)
+    set(Calendar.HOUR_OF_DAY, LIMIT_MORNING_END_HOUR)
+    set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+    timeInMillis
+}
+
+/** 13:00 on the day of [ts] — the afternoon window starts here. */
+fun limitAfternoonStart(ts: Long): Long = Calendar.getInstance().run {
+    timeInMillis = floorDay(ts)
+    set(Calendar.HOUR_OF_DAY, LIMIT_AFTERNOON_START_HOUR)
+    set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+    timeInMillis
+}
+
+/** Worked time inside the morning window, counting open sessions only up to [cutoff]. */
+fun morningWork(entries: List<Punch>, dayStart: Long, cutoff: Long): Long =
+    totalInRange(entries, floorDay(dayStart), limitMorningEnd(dayStart), cutoff)
+
+/** Worked time inside the afternoon window, counting open sessions only up to [cutoff]. */
+fun afternoonWork(entries: List<Punch>, dayStart: Long, cutoff: Long): Long =
+    totalInRange(entries, limitAfternoonStart(dayStart), nextDayStart(dayStart), cutoff)
+
+/**
+ * When each work-limit mark will be crossed, assuming the open session that
+ * starts at [openIn] keeps running until a mark stops it. Call only while
+ * clocked in; returns crossings in time order (possibly already in the past,
+ * which is how a missed alarm is detected).
+ *
+ * Windows: morning [00:00, 11:00), free gap [11:00, 13:00) — unlimited and
+ * counting toward nothing — then afternoon [13:00, 24:00). Marks: 30 min per
+ * window and 60 min of window work per day. The day mark's accrual is
+ * deliberately NOT capped by the half marks, so it backstops a session that
+ * clocks back in after a half-hour stop.
+ */
+fun limitCrossings(entries: List<Punch>, openIn: Long): List<LimitMark> {
+    val dayStart = floorDay(openIn)
+    val mEnd = limitMorningEnd(dayStart)
+    val aStart = limitAfternoonStart(dayStart)
+    val marks = ArrayList<LimitMark>()
+
+    val mDone = morningWork(entries, dayStart, openIn)
+    val aDone = afternoonWork(entries, dayStart, openIn)
+
+    val remM = LIMIT_HALF_MS - mDone
+    if (remM > 0) {
+        val t = maxOf(openIn, dayStart) + remM
+        if (t <= mEnd) marks += LimitMark(LimitKind.HALF_MORNING, t)
+    }
+    val remA = LIMIT_HALF_MS - aDone
+    if (remA > 0) {
+        val t = maxOf(openIn, aStart) + remA
+        if (t < nextDayStart(dayStart)) marks += LimitMark(LimitKind.HALF_AFTERNOON, t)
+    }
+    val remD0 = LIMIT_DAY_MS - (mDone + aDone)
+    if (remD0 > 0) {
+        var remD = remD0
+        var t = maxOf(openIn, dayStart)
+        if (t < mEnd) {
+            val chunk = minOf(remD, mEnd - t)
+            t += chunk
+            remD -= chunk
+        }
+        if (remD > 0) {
+            if (t < aStart) t = aStart // the free gap moves the clock on, not the allowance
+            t += remD
+        }
+        marks += LimitMark(LimitKind.DAY, t)
+    }
+    return marks.sortedBy { it.at }
+}

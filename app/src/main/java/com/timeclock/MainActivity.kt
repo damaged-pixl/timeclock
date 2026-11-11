@@ -2,12 +2,18 @@ package com.timeclock
 
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -30,8 +36,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -49,6 +57,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
 import java.text.SimpleDateFormat
@@ -86,10 +95,25 @@ class MainActivity : ComponentActivity() {
     private var pendingDelete by mutableStateOf<Punch?>(null)
     private var confirmReset by mutableStateOf(false)
     private var ratePence by mutableIntStateOf(0)
+    private var showLimit by mutableStateOf(false)
 
     /** Non-null while the month report is open; holds that month's first instant. */
     private var reportMonth by mutableStateOf<Long?>(null)
     private var editingPunch by mutableStateOf<Punch?>(null)
+
+    /** The enforcer service broadcasts here right after writing an auto clock-out. */
+    private val limitTriggered = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            reload()
+            val outTs = punches.lastOrNull()?.takeIf { !it.isIn }?.ts
+            Toast.makeText(
+                this@MainActivity,
+                if (outTs != null) "Work limit reached — auto clocked out at ${fmtClock(outTs)}"
+                else "Work limit reached — auto clocked out",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
 
     /** CSV restore: reads punches back in, skipping ones already recorded. */
     private val importLauncher =
@@ -101,13 +125,40 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         db = TimeDb(this)
         ratePence = getSharedPreferences("settings", MODE_PRIVATE).getInt("rate_pence", 0)
+        ContextCompat.registerReceiver(
+            this, limitTriggered,
+            IntentFilter(LimitService.ACTION_TRIGGERED),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         seedIfEmpty()
         reload()
         setContent { App() }
     }
 
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(limitTriggered)
+        } catch (e: IllegalArgumentException) {
+            // never registered (creation failed early) — nothing to clean up
+        }
+        super.onDestroy()
+    }
+
     private fun reload() {
         punches = db.allPunches()
+        limitRefresh()
+    }
+
+    /**
+     * Re-arm the work-limit enforcement after any state change: recompute
+     * alarms (which also catches marks crossed while we couldn't act) and
+     * keep the watch service running exactly while the limit is enforceable.
+     */
+    private fun limitRefresh() {
+        val stopped = Limit.checkAndSchedule(this)
+        if (stopped) punches = db.allPunches() // a missed mark was backdated just now
+        val armed = Limit.armedToday(this, System.currentTimeMillis()) && isClockedIn(punches)
+        if (armed) LimitService.ensureStarted(this) else LimitService.stopIfNeeded(this)
     }
 
     /**
@@ -309,6 +360,15 @@ class MainActivity : ComponentActivity() {
         val history = buildHistory(punches, now)
         val dayFmt = SimpleDateFormat("EEE d MMM", Locale.UK)
 
+        // Work-limit readout: how much of the current half-day and the day
+        // allowance is used. The 11:00–13:00 gap counts toward the afternoon
+        // figure only if actual afternoon-window work exists.
+        val limitLive = Limit.armedToday(this, now)
+        val mWork = morningWork(punches, dayStart, now)
+        val aWork = afternoonWork(punches, dayStart, now)
+        val halfWork = if (now < limitMorningEnd(dayStart)) mWork else aWork
+        val dayWork = mWork + aWork
+
         Surface(modifier = Modifier.fillMaxSize(), color = Bg) {
             val report = reportMonth
             if (report != null) {
@@ -337,6 +397,13 @@ class MainActivity : ComponentActivity() {
                         Text(
                             "this session  ${fmtHms(sessionMs)}",
                             color = InGreen, fontSize = 14.sp,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                    if (clockedIn && limitLive) {
+                        Text(
+                            "limit · half ${fmtDuration(halfWork)}/0:30 · day ${fmtDuration(dayWork)}/1:00",
+                            color = Muted, fontSize = 12.sp,
                             modifier = Modifier.padding(top = 4.dp)
                         )
                     }
@@ -489,6 +556,14 @@ class MainActivity : ComponentActivity() {
                             Text("Reset all data", color = OutRed)
                         }
                     }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = { showLimit = true },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Work limit alarm", color = Accent)
+                        }
+                    }
                     Spacer(Modifier.height(48.dp))
                 }
             }
@@ -533,6 +608,10 @@ class MainActivity : ComponentActivity() {
 
         if (showSettings) {
             RateDialog(onDismiss = { showSettings = false })
+        }
+
+        if (showLimit) {
+            LimitDialog(onDismiss = { showLimit = false })
         }
 
         editingPunch?.let { p ->
@@ -816,6 +895,58 @@ class MainActivity : ComponentActivity() {
             confirmButton = {
                 TextButton(onClick = {
                     saveRate(((text.toDoubleOrNull() ?: 0.0) * 100).roundToInt())
+                    onDismiss()
+                }) { Text("Save", color = Accent) }
+            },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        )
+    }
+
+    /** Work-limit settings: master switch plus the Thursday exemption. */
+    @Composable
+    private fun LimitDialog(onDismiss: () -> Unit) {
+        var on by remember { mutableStateOf(Limit.enabled(this)) }
+        var skipThu by remember { mutableStateOf(Limit.skipThursdays(this)) }
+        val notifLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* the alarm works regardless; notifications are just nicer */ }
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Work limit alarm") },
+            text = {
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("On", Modifier.weight(1f), fontSize = 16.sp, color = Color.White)
+                        Switch(checked = on, onCheckedChange = { checked ->
+                            on = checked
+                            if (checked && Build.VERSION.SDK_INT >= 33 &&
+                                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                                != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        })
+                    }
+                    Text(
+                        "Blare and auto clock-out at 30 min per half-day " +
+                            "(morning before 11:00, afternoon after 13:00; " +
+                            "11:00–13:00 is free) and at 1 hour a day.",
+                        color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp)
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 8.dp)
+                    ) {
+                        Text("Skip Thursdays", Modifier.weight(1f), fontSize = 16.sp, color = Color.White)
+                        Checkbox(checked = skipThu, onCheckedChange = { skipThu = it })
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    Limit.save(this, on, skipThu)
+                    limitRefresh()
                     onDismiss()
                 }) { Text("Save", color = Accent) }
             },

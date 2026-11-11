@@ -1,10 +1,11 @@
 # timeclock — work clock in/out tracker
 
-Launcher name **Clock In** (v3.1, 2026-11-04). v2 (2026-09-02) was a rebuild of an
+Launcher name **Clock In** (v3.2, 2026-11-11). v2 (2026-09-02) was a rebuild of an
 earlier AI-generated build whose clock-in/out silently duplicated "in" punches and lost
 clock-outs, corrupting recorded hours; v3 renamed the app, gave it a real adaptive
 icon, and replaced the today-only punch list with a full day-grouped history. v3.1 added
 monthly reports, in-place punch editing, CSV restore, and DST-safe day boundaries.
+v3.2 added the work-limit alarm.
 
 ## Stack
 
@@ -13,6 +14,29 @@ Kotlin + Jetpack Compose, single `MainActivity`. Package `com.timeclock`, applic
 (`timeclock.db`, table `punches(id, ts, type)` — same schema as the original, type is
 `"in"`/`"out"`, ts is epoch millis). Hourly rate lives in SharedPreferences
 (`settings`/`rate_pence`, 0 = earnings hidden).
+
+## Work-limit alarm (v3.2)
+
+Optional enforcement (settings → "Work limit alarm", master toggle + "Skip
+Thursdays"): blares and **auto clock-outs** when work hits the marks — 30 min per
+half-day (morning window `[00:00, 11:00)`, afternoon `[13:00, 24:00)`; the gap
+11:00–13:00 is free and counts toward nothing) and 1 hour of window work per day.
+Mark maths are pure functions in `Calc.kt` (`limitCrossings()`), so sessions spanning
+the windows are handled exactly. Key invariants:
+
+- Auto clock-outs are real "out" punches at the exact mark instant — clock state stays
+  derived-from-last-punch, no extra stored state anywhere.
+- Enforcement state is always recomputed from the db (`Limit.checkAndSchedule()`,
+  called on every punch change / app open / settings change / boot). It backdates an
+  auto-out if a mark was crossed while nothing could act (missed alarm, reboot).
+- `LimitService` is a foreground `mediaPlayback` service: quiet "armed" notification
+  while clocked in, blaring loop (alarm ringtone at half the alarm volume, raised
+  only if quieter, restored after; repeating vibration, 5-min safety cap) on a
+  mark. Exact alarms via
+  `LimitReceiver` (USE_EXACT_ALARM) are the doze backup that start it.
+- The 1-hour day mark's accrual is deliberately NOT capped by the half marks, so it
+  backstops a session that clocks back in after a half-hour stop (+30 min grace).
+- Tests: all mark maths in `CalcTest.kt` — keep them passing when touched.
 
 ## Build / install
 
