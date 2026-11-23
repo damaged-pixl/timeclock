@@ -82,7 +82,6 @@ class LimitService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var player: MediaPlayer? = null
     private var vibrator: Vibrator? = null
-    private var oldAlarmVolume = -1
 
     private val tickRun = Runnable { tick() }
 
@@ -160,16 +159,9 @@ class LimitService : Service() {
         handler.removeCallbacks(tickRun)
         goForeground(NOTIF_ALARM, alarmNotification())
 
-        // "Blaring" at half alarm volume (Bradley's preference) — raised only
-        // if the stream is quieter than that, restored after.
-        val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val max = audio.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-        val cur = audio.getStreamVolume(AudioManager.STREAM_ALARM)
-        val target = max / 2
-        if (max > 0 && cur < target) {
-            oldAlarmVolume = cur
-            audio.setStreamVolume(AudioManager.STREAM_ALARM, target, 0)
-        }
+        // Plays at Bradley's own alarm volume — the service never raises the
+        // alarm stream volume (a previous version bumped it to half-max, which
+        // was far too loud even when his alarm volume was set low).
 
         val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
@@ -209,11 +201,6 @@ class LimitService : Service() {
         player = null
         vibrator?.cancel()
         vibrator = null
-        if (oldAlarmVolume >= 0) {
-            val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audio.setStreamVolume(AudioManager.STREAM_ALARM, oldAlarmVolume, 0)
-            oldAlarmVolume = -1
-        }
     }
 
     private fun systemVibrator(): Vibrator =
